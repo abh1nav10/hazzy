@@ -4,11 +4,6 @@ use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicPtr};
 
-// let new = Box::into_raw(Box::new(Ret {
-//ptr : AtomicPtr::new(std::ptr::null_mut()),
-//  next : AtomicPtr::new(std::ptr::null_mut()),
-//}));
-
 static SHARED_DOMAIN: HazPtrDomain = HazPtrDomain {
     list: HazPtrs {
         head: AtomicPtr::new(std::ptr::null_mut()),
@@ -48,7 +43,7 @@ impl HazPtrHolder {
         return ret;
     }
 
-    pub fn store<T>(&mut self, value: T) {
+    pub fn swap<T>(&mut self, ptr: *mut T, deleter: fn(*mut ())) -> HazPtrObjectWrapper<T> {
         todo!()
     }
 
@@ -74,17 +69,18 @@ impl HazPtr {
 }
 
 pub trait HazPtrObject {
-    fn domain(&self) -> &HazPtrDomain;
+    fn domain<'a>(&'a self) -> &'a HazPtrDomain;
     fn retire(&mut self, ptr: *mut ());
 }
 
 pub struct HazPtrObjectWrapper<'a, T> {
     inner: *mut T,
     domain: &'a HazPtrDomain,
+    deleter: fn(*mut ()),
 }
 
 impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
-    fn domain(&self) -> &HazPtrDomain {
+    fn domain<'a>(&'a self) -> &'a HazPtrDomain {
         self.domain
     }
     fn retire(&mut self, ptr: *mut ()) {
@@ -94,13 +90,14 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
             let ret = Ret {
                 ptr: AtomicPtr::new(ptr),
                 next: AtomicPtr::new(std::ptr::null_mut()),
+                deleter: self.deleter,
             };
             if current.is_null() {
                 let boxed = Box::leak(Box::new(ret));
                 if domain
                     .ret
                     .head
-                    .compare_exchange_weak(
+                    .compare_exchange(
                         std::ptr::null_mut(),
                         boxed,
                         Ordering::SeqCst,
@@ -112,6 +109,7 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
                     std::mem::drop(drop);
                 } else {
                     (&domain.ret).reclaim(&domain.list);
+                    break;
                 }
             } else {
                 ret.next.store(current, Ordering::SeqCst);
@@ -119,13 +117,14 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
                 if domain
                     .ret
                     .head
-                    .compare_exchange_weak(current, boxed, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange(current, boxed, Ordering::SeqCst, Ordering::SeqCst)
                     .is_err()
                 {
                     let drop = unsafe { Box::from_raw(boxed) };
                     std::mem::drop(drop);
                 } else {
                     (&domain.ret).reclaim(&domain.list);
+                    break;
                 }
             }
         }
@@ -147,7 +146,7 @@ pub struct HazPtrDomain {
 impl HazPtrDomain {
     pub fn acquire(&self) -> &'static HazPtr {
         if self.list.head.load(Ordering::SeqCst).is_null() {
-            let mut hazptr = HazPtr {
+            let hazptr = HazPtr {
                 ptr: AtomicPtr::new(std::ptr::null_mut()),
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 flag: AtomicBool::new(false),
@@ -233,26 +232,32 @@ struct Retired {
 struct Ret {
     ptr: AtomicPtr<()>,
     next: AtomicPtr<Ret>,
+    deleter: fn(*mut ()),
 }
 
 impl Retired {
     fn reclaim<'a>(&self, domain: &'a HazPtrs) {
         let mut set = HashSet::new();
-        let mut current = (&domain.head).load(Ordering::SeqCst);
+        let mut current = (&(domain.head)).load(Ordering::SeqCst);
         while !current.is_null() {
             let a = unsafe { (*current).ptr.load(Ordering::SeqCst) };
             set.insert(a);
             current = unsafe { (&(*current).next).load(Ordering::SeqCst) };
         }
-        let mut now = (&self.head).load(Ordering::SeqCst);
+        let mut remaining = std::ptr::null_mut();
+        let mut now = (self.head).swap(std::ptr::null_mut(), Ordering::SeqCst);
         while !now.is_null() {
             let check = unsafe { ((*now).ptr).load(Ordering::SeqCst) };
-            if !set.contains(&check) {
-                // outt
-                now = unsafe { ((*now).next).load(Ordering::SeqCst) };
+            if !set.contains(&(check as *mut ())) {
+                let deleter = unsafe { (*now).deleter };
+                (deleter)(check);
             } else {
-                now = unsafe { ((*now).next).load(Ordering::SeqCst) };
+                let next = unsafe { ((*now).next).load(Ordering::SeqCst) };
+                unsafe { (*now).next.store(remaining, Ordering::SeqCst) };
+                remaining = now;
+                now = next;
             }
         }
+        self.head.swap(remaining, Ordering::SeqCst);
     }
 }
