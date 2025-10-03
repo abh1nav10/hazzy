@@ -1,5 +1,6 @@
 use std::collections::HashSet;
-use std::ops::Deref;
+use std::marker::PhantomData;
+use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicPtr};
@@ -13,10 +14,44 @@ static SHARED_DOMAIN: HazPtrDomain = HazPtrDomain {
     },
 };
 
+#[derive(Default)]
 pub struct HazPtrHolder(Option<&'static HazPtr>);
 
+pub struct Guard<'a, T> {
+    hazptr: &'static HazPtr,
+    data: *mut T,
+    _marker: PhantomData<&'a T>,
+}
+
+impl<T> Deref for Guard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &(*self.data) }
+    }
+}
+
+impl<T> DerefMut for Guard<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut (*self.data) }
+    }
+}
+
+impl<T> Drop for Guard<'_, T> {
+    fn drop(&mut self) {
+        self.hazptr
+            .ptr
+            .store(std::ptr::null_mut(), Ordering::SeqCst);
+        self.hazptr.flag.store(true, Ordering::SeqCst);
+    }
+}
+
 impl HazPtrHolder {
-    pub fn load<'a, T>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<&'a T> {
+    /// SAFETY:
+    ///   1. The user must pass a valid pointer. Passing in invalid pointers such as a misaligned
+    ///      one will cause undefined behaviour.
+    ///   2. If a null pointer is passed that will be taken care of by the implementation as we
+    ///      have made sure using NonNull that it does not get dereferenced.
+    pub unsafe fn load<'a, T>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<Guard<'a, T>> {
         let hazptr = if let Some(t) = self.0 {
             t
         } else {
@@ -25,13 +60,17 @@ impl HazPtrHolder {
             ptr
         };
         let mut ptr1 = ptr.load(Ordering::SeqCst);
-        hazptr.protect(ptr1 as *mut ());
         let ret = loop {
+            hazptr.protect(ptr1 as *mut ());
             let ptr2 = ptr.load(Ordering::SeqCst);
             if ptr1 == ptr2 {
                 if let Some(_) = NonNull::new(ptr1) {
-                    let ret = unsafe { ptr1.as_ref() };
-                    break ret;
+                    let data = ptr1;
+                    break Some(Guard {
+                        hazptr: &hazptr,
+                        data: data,
+                        _marker: PhantomData,
+                    });
                 } else {
                     break None;
                 }
@@ -39,24 +78,107 @@ impl HazPtrHolder {
                 ptr1 = ptr2;
             }
         };
-        self.reset();
         return ret;
     }
 
-    pub fn swap<T>(&mut self, ptr: *mut T, deleter: fn(*mut ())) -> HazPtrObjectWrapper<T> {
-        todo!()
+    ///SAFETY:
+    ///  1. Swap ensures that the old pointer gets retired. The user must make sure that similar to
+    ///     the load method, a valid pointer is passed failing which will cause undefined
+    ///     behaviour.
+    ///  2. Calling the swap method with a retired pointer will cause the retired pointer to be
+    ///     retired again which will lead to it being double reclaimed leading to undefined
+    ///     behaviour. The user must ensure that this does not happen.
+    ///  3. This method must not be called for as long as the Guard is active failing which will
+    ///     create a dangling reference.
+    pub unsafe fn swap<T>(
+        &mut self,
+        atomic: &'_ AtomicPtr<T>,
+        ptr: *mut T,
+        deleter: fn(*mut ()),
+    ) -> Option<HazPtrObjectWrapper<'_, T>> {
+        let current = atomic.load(Ordering::SeqCst);
+        atomic.store(ptr, Ordering::SeqCst);
+        let wrapper = HazPtrObjectWrapper {
+            inner: current,
+            domain: &SHARED_DOMAIN,
+            deleter: deleter,
+        };
+        if let Some(t) = self.0 {
+            if t.ptr.load(Ordering::SeqCst).is_null() {
+                t.flag.store(true, Ordering::SeqCst);
+                self.0 = None;
+                if current.is_null() {
+                    return None;
+                } else {
+                    return Some(wrapper);
+                }
+            } else {
+                t.ptr.store(std::ptr::null_mut(), Ordering::SeqCst);
+                t.flag.store(true, Ordering::SeqCst);
+                self.0 = None;
+                if current.is_null() {
+                    return None;
+                } else {
+                    return Some(wrapper);
+                }
+            }
+        } else {
+            if current.is_null() {
+                return None;
+            } else {
+                return Some(wrapper);
+            }
+        }
     }
 
-    pub fn reset(&mut self) {
+    ///SAFETY:
+    ///  1. This method provides a way to get the wrappet to call the retire method if the user is
+    ///     not relying on swap. It must be used with care as repeatedly using load without
+    ///     using this method and calling retire on it will lead to memory leaks.
+    ///  2. This method must not be called for as long as the guard is active failing which will
+    ///     create a dangling reference.
+    pub unsafe fn get_wrapper<T>(
+        &mut self,
+        atomic: &'_ AtomicPtr<T>,
+        deleter: fn(*mut ()),
+    ) -> Option<HazPtrObjectWrapper<'_, T>> {
+        let current = atomic.load(Ordering::SeqCst);
+        atomic.store(std::ptr::null_mut(), Ordering::SeqCst);
+        let wrapper = HazPtrObjectWrapper {
+            inner: current,
+            domain: &SHARED_DOMAIN,
+            deleter: deleter,
+        };
         if let Some(t) = self.0 {
-            t.ptr.store(std::ptr::null_mut(), Ordering::SeqCst);
-            t.flag.store(true, Ordering::SeqCst);
-            self.0 = None;
+            if t.ptr.load(Ordering::SeqCst).is_null() {
+                t.flag.store(true, Ordering::SeqCst);
+                self.0 = None;
+                if current.is_null() {
+                    return None;
+                } else {
+                    return Some(wrapper);
+                }
+            } else {
+                t.ptr.store(std::ptr::null_mut(), Ordering::SeqCst);
+                t.flag.store(true, Ordering::SeqCst);
+                self.0 = None;
+                if current.is_null() {
+                    return None;
+                } else {
+                    return Some(wrapper);
+                }
+            }
+        } else {
+            if current.is_null() {
+                return None;
+            } else {
+                return Some(wrapper);
+            }
         }
     }
 }
 
-struct HazPtr {
+pub struct HazPtr {
     ptr: AtomicPtr<()>,
     next: AtomicPtr<HazPtr>,
     flag: AtomicBool,
@@ -70,7 +192,7 @@ impl HazPtr {
 
 pub trait HazPtrObject {
     fn domain<'a>(&'a self) -> &'a HazPtrDomain;
-    fn retire(&mut self, ptr: *mut ());
+    fn retire(&mut self);
 }
 
 pub struct HazPtrObjectWrapper<'a, T> {
@@ -79,16 +201,32 @@ pub struct HazPtrObjectWrapper<'a, T> {
     deleter: fn(*mut ()),
 }
 
+impl<T> Deref for HazPtrObjectWrapper<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &(*self.inner) }
+    }
+}
+
+impl<T> DerefMut for HazPtrObjectWrapper<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut (*self.inner) }
+    }
+}
+
 impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
     fn domain<'a>(&'a self) -> &'a HazPtrDomain {
         self.domain
     }
-    fn retire(&mut self, ptr: *mut ()) {
+
+    ///SAFETY:
+    ///  The user must make sure that a retired pointer is not retired again.
+    fn retire(&mut self) {
         let domain = self.domain();
         let current = (&domain.ret.head).load(Ordering::SeqCst);
         loop {
             let ret = Ret {
-                ptr: AtomicPtr::new(ptr),
+                ptr: AtomicPtr::new(self.inner as *mut ()),
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 deleter: self.deleter,
             };
@@ -108,7 +246,7 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
                     let drop = unsafe { Box::from_raw(boxed) };
                     std::mem::drop(drop);
                 } else {
-                    (&domain.ret).reclaim(&domain.list);
+                    unsafe { (&domain.ret).reclaim(&domain.list) };
                     break;
                 }
             } else {
@@ -123,18 +261,11 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
                     let drop = unsafe { Box::from_raw(boxed) };
                     std::mem::drop(drop);
                 } else {
-                    (&domain.ret).reclaim(&domain.list);
+                    unsafe { (&domain.ret).reclaim(&domain.list) };
                     break;
                 }
             }
         }
-    }
-}
-
-impl<T> Deref for HazPtrObjectWrapper<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &Self::Target {
-        unsafe { &(*self.inner) }
     }
 }
 
@@ -193,7 +324,7 @@ impl HazPtrDomain {
                 .list
                 .head
                 .compare_exchange(
-                    now.load(Ordering::Relaxed),
+                    now.load(Ordering::SeqCst),
                     boxed,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
@@ -236,7 +367,11 @@ struct Ret {
 }
 
 impl Retired {
-    fn reclaim<'a>(&self, domain: &'a HazPtrs) {
+    /// SAFETY:
+    ///    The user must make sure that the reclaim method is not called on the list of retired
+    ///    pointers contaning two similar pointers as this will lead to the same pointers being
+    ///    dereferenced leading to undefined behaviour.
+    unsafe fn reclaim<'a>(&self, domain: &'a HazPtrs) {
         let mut set = HashSet::new();
         let mut current = (&(domain.head)).load(Ordering::SeqCst);
         while !current.is_null() {
@@ -251,6 +386,10 @@ impl Retired {
             if !set.contains(&(check as *mut ())) {
                 let deleter = unsafe { (*now).deleter };
                 (deleter)(check);
+                let go = now;
+                now = unsafe { ((*now).next).load(Ordering::SeqCst) };
+                let drop = unsafe { Box::from_raw(go) };
+                std::mem::drop(drop);
             } else {
                 let next = unsafe { ((*now).next).load(Ordering::SeqCst) };
                 unsafe { (*now).next.store(remaining, Ordering::SeqCst) };
@@ -259,5 +398,47 @@ impl Retired {
             }
         }
         self.head.swap(remaining, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    struct CountDrops(Arc<AtomicUsize>);
+    impl Drop for CountDrops {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    impl CountDrops {
+        fn get_number_of_drops(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+    fn deleter(ptr: *mut ()) {
+        if let Some(_) = NonNull::new(ptr) {
+            let actual = ptr as *mut CountDrops;
+            let drop = unsafe { Box::from_raw(actual) };
+            std::mem::drop(drop);
+        }
+    }
+    #[test]
+    fn test() {
+        let new = Arc::new(AtomicUsize::new(0));
+        let check = CountDrops(new.clone());
+        let value1 = CountDrops(new.clone());
+        let value2 = CountDrops(new.clone());
+        let boxed1 = Box::into_raw(Box::new(value1));
+        let boxed2 = Box::into_raw(Box::new(value2));
+        let atm_ptr = AtomicPtr::new(boxed1);
+        let mut holder = HazPtrHolder::default();
+        let guard = unsafe { holder.load(&atm_ptr) };
+        std::mem::drop(guard);
+        if let Some(mut wrapper) = unsafe { holder.swap(&atm_ptr, boxed2, deleter) } {
+            wrapper.retire();
+        }
+        assert_eq!(check.get_number_of_drops(), 1 as usize);
     }
 }
