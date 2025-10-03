@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
@@ -74,27 +75,67 @@ impl HazPtr {
 
 pub trait HazPtrObject {
     fn domain(&self) -> &HazPtrDomain;
-    fn retire(ptr: *mut ());
+    fn retire(&mut self, ptr: *mut ());
 }
 
-pub struct HazPtrObjectWrapper<'a: 'b, 'b, T> {
-    inner: &'b T,
+pub struct HazPtrObjectWrapper<'a, T> {
+    inner: *mut T,
     domain: &'a HazPtrDomain,
 }
 
-impl<T> HazPtrObject for HazPtrObjectWrapper<'_, '_, T> {
+impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
     fn domain(&self) -> &HazPtrDomain {
         self.domain
     }
-    fn retire(ptr: *mut ()) {
-        todo!()
+    fn retire(&mut self, ptr: *mut ()) {
+        let domain = self.domain();
+        let current = (&domain.ret.head).load(Ordering::SeqCst);
+        loop {
+            let ret = Ret {
+                ptr: AtomicPtr::new(ptr),
+                next: AtomicPtr::new(std::ptr::null_mut()),
+            };
+            if current.is_null() {
+                let boxed = Box::leak(Box::new(ret));
+                if domain
+                    .ret
+                    .head
+                    .compare_exchange_weak(
+                        std::ptr::null_mut(),
+                        boxed,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    let drop = unsafe { Box::from_raw(boxed) };
+                    std::mem::drop(drop);
+                } else {
+                    (&domain.ret).reclaim(&domain.list);
+                }
+            } else {
+                ret.next.store(current, Ordering::SeqCst);
+                let boxed = Box::leak(Box::new(ret));
+                if domain
+                    .ret
+                    .head
+                    .compare_exchange_weak(current, boxed, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    let drop = unsafe { Box::from_raw(boxed) };
+                    std::mem::drop(drop);
+                } else {
+                    (&domain.ret).reclaim(&domain.list);
+                }
+            }
+        }
     }
 }
 
-impl<T> Deref for HazPtrObjectWrapper<'_, '_, T> {
+impl<T> Deref for HazPtrObjectWrapper<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        self.inner
+        unsafe { &(*self.inner) }
     }
 }
 
@@ -189,13 +230,29 @@ struct Retired {
     head: AtomicPtr<Ret>,
 }
 
-impl Retired {
-    fn reclaim(&mut self) {
-        todo!()
-    }
-}
-
 struct Ret {
     ptr: AtomicPtr<()>,
     next: AtomicPtr<Ret>,
+}
+
+impl Retired {
+    fn reclaim<'a>(&self, domain: &'a HazPtrs) {
+        let mut set = HashSet::new();
+        let mut current = (&domain.head).load(Ordering::SeqCst);
+        while !current.is_null() {
+            let a = unsafe { (*current).ptr.load(Ordering::SeqCst) };
+            set.insert(a);
+            current = unsafe { (&(*current).next).load(Ordering::SeqCst) };
+        }
+        let mut now = (&self.head).load(Ordering::SeqCst);
+        while !now.is_null() {
+            let check = unsafe { ((*now).ptr).load(Ordering::SeqCst) };
+            if !set.contains(&check) {
+                // outt
+                now = unsafe { ((*now).next).load(Ordering::SeqCst) };
+            } else {
+                now = unsafe { ((*now).next).load(Ordering::SeqCst) };
+            }
+        }
+    }
 }
