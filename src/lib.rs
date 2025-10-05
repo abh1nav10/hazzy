@@ -30,12 +30,6 @@ impl<T> Deref for Guard<'_, T> {
     }
 }
 
-impl<T> DerefMut for Guard<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut (*self.data) }
-    }
-}
-
 impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
         self.hazptr
@@ -88,8 +82,6 @@ impl HazPtrHolder {
     ///  2. Calling the swap method with a retired pointer will cause the retired pointer to be
     ///     retired again which will lead to it being double reclaimed leading to undefined
     ///     behaviour. The user must ensure that this does not happen.
-    ///  3. This method must not be called for as long as the Guard is active failing which will
-    ///     create a dangling reference.
     pub unsafe fn swap<T>(
         &mut self,
         atomic: &'_ AtomicPtr<T>,
@@ -103,40 +95,13 @@ impl HazPtrHolder {
             domain: &SHARED_DOMAIN,
             deleter: deleter,
         };
-        if let Some(t) = self.0 {
-            if t.ptr.load(Ordering::SeqCst).is_null() {
-                t.flag.store(true, Ordering::SeqCst);
-                self.0 = None;
-                if current.is_null() {
-                    return None;
-                } else {
-                    return Some(wrapper);
-                }
-            } else {
-                t.ptr.store(std::ptr::null_mut(), Ordering::SeqCst);
-                t.flag.store(true, Ordering::SeqCst);
-                self.0 = None;
-                if current.is_null() {
-                    return None;
-                } else {
-                    return Some(wrapper);
-                }
-            }
-        } else {
-            if current.is_null() {
-                return None;
-            } else {
-                return Some(wrapper);
-            }
-        }
+        return Some(wrapper);
     }
 
     ///SAFETY:
-    ///  1. This method provides a way to get the wrappet to call the retire method if the user is
+    ///  1. This method provides a way to get the wrapper to call the retire method if the user is
     ///     not relying on swap. It must be used with care as repeatedly using load without
     ///     using this method and calling retire on it will lead to memory leaks.
-    ///  2. This method must not be called for as long as the guard is active failing which will
-    ///     create a dangling reference.
     pub unsafe fn get_wrapper<T>(
         &mut self,
         atomic: &'_ AtomicPtr<T>,
@@ -149,32 +114,7 @@ impl HazPtrHolder {
             domain: &SHARED_DOMAIN,
             deleter: deleter,
         };
-        if let Some(t) = self.0 {
-            if t.ptr.load(Ordering::SeqCst).is_null() {
-                t.flag.store(true, Ordering::SeqCst);
-                self.0 = None;
-                if current.is_null() {
-                    return None;
-                } else {
-                    return Some(wrapper);
-                }
-            } else {
-                t.ptr.store(std::ptr::null_mut(), Ordering::SeqCst);
-                t.flag.store(true, Ordering::SeqCst);
-                self.0 = None;
-                if current.is_null() {
-                    return None;
-                } else {
-                    return Some(wrapper);
-                }
-            }
-        } else {
-            if current.is_null() {
-                return None;
-            } else {
-                return Some(wrapper);
-            }
-        }
+        return Some(wrapper);
     }
 }
 
