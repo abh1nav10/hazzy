@@ -1,3 +1,6 @@
+#![allow(drop_bounds)]
+#![allow(dyn_drop)]
+
 use std::collections::HashSet;
 use std::convert::AsRef;
 use std::marker::PhantomData;
@@ -18,26 +21,26 @@ static SHARED_DOMAIN: HazPtrDomain = HazPtrDomain {
 #[derive(Default)]
 pub struct HazPtrHolder(Option<&'static HazPtr>);
 
-pub struct Guard<'a, T> {
+pub struct Guard<'a, T: Drop> {
     hazptr: &'static HazPtr,
     data: *mut T,
     _marker: PhantomData<&'a T>,
 }
 
-impl<T> AsRef<T> for Guard<'_, T> {
+impl<T: Drop> AsRef<T> for Guard<'_, T> {
     fn as_ref(&self) -> &T {
         &(*self)
     }
 }
 
-impl<T> Deref for Guard<'_, T> {
+impl<T: Drop> Deref for Guard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &(*self.data) }
     }
 }
 
-impl<T> Drop for Guard<'_, T> {
+impl<T: Drop> Drop for Guard<'_, T> {
     fn drop(&mut self) {
         self.hazptr
             .ptr
@@ -52,7 +55,7 @@ impl HazPtrHolder {
     ///      one will cause undefined behaviour.
     ///   2. If a null pointer is passed that will be taken care of by the implementation as we
     ///      have made sure using NonNull that it does not get dereferenced.
-    pub unsafe fn load<'a, T>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<Guard<'a, T>> {
+    pub unsafe fn load<'a, T: Drop>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<Guard<'a, T>> {
         let hazptr = if let Some(t) = self.0 {
             t
         } else {
@@ -89,11 +92,11 @@ impl HazPtrHolder {
     ///  2. Calling the swap method with a retired pointer will cause the retired pointer to be
     ///     retired again which will lead to it being double reclaimed leading to undefined
     ///     behaviour. The user must ensure that this does not happen.
-    pub unsafe fn swap<T>(
+    pub unsafe fn swap<T: Drop>(
         &mut self,
         atomic: &'_ AtomicPtr<T>,
         ptr: *mut T,
-        deleter: fn(*mut ()),
+        deleter: &'static dyn Deleter,
     ) -> Option<HazPtrObjectWrapper<'_, T>> {
         let current = atomic.load(Ordering::SeqCst);
         atomic.store(ptr, Ordering::SeqCst);
@@ -109,10 +112,10 @@ impl HazPtrHolder {
     ///  1. This method provides a way to get the wrapper to call the retire method if the user is
     ///     not relying on swap. It must be used with care as repeatedly using load without
     ///     using this method and calling retire on it will lead to memory leaks.
-    pub unsafe fn get_wrapper<T>(
+    pub unsafe fn get_wrapper<T: Drop>(
         &mut self,
         atomic: &'_ AtomicPtr<T>,
-        deleter: fn(*mut ()),
+        deleter: &'static dyn Deleter,
     ) -> Option<HazPtrObjectWrapper<'_, T>> {
         let current = atomic.load(Ordering::SeqCst);
         atomic.store(std::ptr::null_mut(), Ordering::SeqCst);
@@ -142,26 +145,26 @@ pub trait HazPtrObject {
     fn retire(&mut self);
 }
 
-pub struct HazPtrObjectWrapper<'a, T> {
+pub struct HazPtrObjectWrapper<'a, T: Drop> {
     inner: *mut T,
     domain: &'a HazPtrDomain,
-    deleter: fn(*mut ()),
+    deleter: &'static dyn Deleter,
 }
 
-impl<T> Deref for HazPtrObjectWrapper<'_, T> {
+impl<T: Drop> Deref for HazPtrObjectWrapper<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &(*self.inner) }
     }
 }
 
-impl<T> DerefMut for HazPtrObjectWrapper<'_, T> {
+impl<T: Drop> DerefMut for HazPtrObjectWrapper<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut (*self.inner) }
     }
 }
 
-impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
+impl<T: Drop> HazPtrObject for HazPtrObjectWrapper<'_, T> {
     fn domain<'a>(&'a self) -> &'a HazPtrDomain {
         self.domain
     }
@@ -173,7 +176,7 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
         let current = (&domain.ret.head).load(Ordering::SeqCst);
         loop {
             let ret = Ret {
-                ptr: AtomicPtr::new(self.inner as *mut ()),
+                ptr: self.inner as *mut dyn Drop,
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 deleter: self.deleter,
             };
@@ -229,7 +232,7 @@ impl HazPtrDomain {
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 flag: AtomicBool::new(false),
             };
-            let raw = Box::leak(Box::new(hazptr));
+            let raw = Box::into_raw(Box::new(hazptr));
             if self
                 .list
                 .head
@@ -266,7 +269,7 @@ impl HazPtrDomain {
                 flag: AtomicBool::new(false),
             };
             new.next = AtomicPtr::new(now.load(Ordering::SeqCst));
-            let boxed = Box::leak(Box::new(new));
+            let boxed = Box::into_raw(Box::new(new));
             if self
                 .list
                 .head
@@ -308,9 +311,48 @@ struct Retired {
 }
 
 struct Ret {
-    ptr: AtomicPtr<()>,
+    ptr: *mut dyn Drop,
     next: AtomicPtr<Ret>,
-    deleter: fn(*mut ()),
+    deleter: &'static dyn Deleter,
+}
+
+pub trait Deleter {
+    fn delete(&self, ptr: *mut dyn Drop);
+}
+
+pub struct DropBox;
+
+impl DropBox {
+    pub const fn new() -> Self {
+        DropBox
+    }
+}
+
+impl Deleter for DropBox {
+    fn delete(&self, ptr: *mut dyn Drop) {
+        if let Some(_) = NonNull::new(ptr) {
+            let drop = unsafe { Box::from_raw(ptr) };
+            std::mem::drop(drop);
+        }
+    }
+}
+
+pub struct DropPointer;
+
+impl DropPointer {
+    pub const fn new() -> Self {
+        DropPointer
+    }
+}
+
+impl Deleter for DropPointer {
+    fn delete(&self, ptr: *mut dyn Drop) {
+        if let Some(_) = NonNull::new(ptr) {
+            unsafe {
+                std::ptr::drop_in_place(ptr);
+            }
+        }
+    }
 }
 
 impl Retired {
@@ -329,10 +371,10 @@ impl Retired {
         let mut remaining = std::ptr::null_mut();
         let mut now = (self.head).swap(std::ptr::null_mut(), Ordering::SeqCst);
         while !now.is_null() {
-            let check = unsafe { ((*now).ptr).load(Ordering::SeqCst) };
+            let check = unsafe { (*now).ptr };
             if !set.contains(&(check as *mut ())) {
                 let deleter = unsafe { (*now).deleter };
-                (deleter)(check);
+                deleter.delete(check);
                 let go = now;
                 now = unsafe { ((*now).next).load(Ordering::SeqCst) };
                 let drop = unsafe { Box::from_raw(go) };
@@ -364,13 +406,6 @@ mod test {
             self.0.load(Ordering::Relaxed)
         }
     }
-    fn deleter(ptr: *mut ()) {
-        if let Some(_) = NonNull::new(ptr) {
-            let actual = ptr as *mut CountDrops;
-            let drop = unsafe { Box::from_raw(actual) };
-            std::mem::drop(drop);
-        }
-    }
     #[test]
     fn test() {
         let new = Arc::new(AtomicUsize::new(0));
@@ -382,8 +417,9 @@ mod test {
         let atm_ptr = AtomicPtr::new(boxed1);
         let mut holder = HazPtrHolder::default();
         let guard = unsafe { holder.load(&atm_ptr) };
+        static DROPBOX: DropBox = DropBox::new();
         std::mem::drop(guard);
-        if let Some(mut wrapper) = unsafe { holder.swap(&atm_ptr, boxed2, deleter) } {
+        if let Some(mut wrapper) = unsafe { holder.swap(&atm_ptr, boxed2, &DROPBOX) } {
             wrapper.retire();
         }
         assert_eq!(check.get_number_of_drops(), 1 as usize);
