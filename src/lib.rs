@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::convert::AsRef;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
@@ -21,6 +22,12 @@ pub struct Guard<'a, T> {
     hazptr: &'static HazPtr,
     data: *mut T,
     _marker: PhantomData<&'a T>,
+}
+
+impl<T> AsRef<T> for Guard<'_, T> {
+    fn as_ref(&self) -> &T {
+        &(*self)
+    }
 }
 
 impl<T> Deref for Guard<'_, T> {
