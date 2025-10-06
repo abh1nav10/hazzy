@@ -1,6 +1,3 @@
-#![allow(drop_bounds)]
-#![allow(dyn_drop)]
-
 use std::collections::HashSet;
 use std::convert::AsRef;
 use std::marker::PhantomData;
@@ -21,26 +18,26 @@ static SHARED_DOMAIN: HazPtrDomain = HazPtrDomain {
 #[derive(Default)]
 pub struct HazPtrHolder(Option<&'static HazPtr>);
 
-pub struct Guard<'a, T: Drop> {
+pub struct Guard<'a, T> {
     hazptr: &'static HazPtr,
     data: *mut T,
     _marker: PhantomData<&'a T>,
 }
 
-impl<T: Drop> AsRef<T> for Guard<'_, T> {
+impl<T> AsRef<T> for Guard<'_, T> {
     fn as_ref(&self) -> &T {
         &(*self)
     }
 }
 
-impl<T: Drop> Deref for Guard<'_, T> {
+impl<T> Deref for Guard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &(*self.data) }
     }
 }
 
-impl<T: Drop> Drop for Guard<'_, T> {
+impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
         self.hazptr
             .ptr
@@ -55,7 +52,7 @@ impl HazPtrHolder {
     ///      one will cause undefined behaviour.
     ///   2. If a null pointer is passed that will be taken care of by the implementation as we
     ///      have made sure using NonNull that it does not get dereferenced.
-    pub unsafe fn load<'a, T: Drop>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<Guard<'a, T>> {
+    pub unsafe fn load<'a, T>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<Guard<'a, T>> {
         let hazptr = if let Some(t) = self.0 {
             t
         } else {
@@ -92,7 +89,7 @@ impl HazPtrHolder {
     ///  2. Calling the swap method with a retired pointer will cause the retired pointer to be
     ///     retired again which will lead to it being double reclaimed leading to undefined
     ///     behaviour. The user must ensure that this does not happen.
-    pub unsafe fn swap<T: Drop>(
+    pub unsafe fn swap<T>(
         &mut self,
         atomic: &'_ AtomicPtr<T>,
         ptr: *mut T,
@@ -112,7 +109,7 @@ impl HazPtrHolder {
     ///  1. This method provides a way to get the wrapper to call the retire method if the user is
     ///     not relying on swap. It must be used with care as repeatedly using load without
     ///     using this method and calling retire on it will lead to memory leaks.
-    pub unsafe fn get_wrapper<T: Drop>(
+    pub unsafe fn get_wrapper<T>(
         &mut self,
         atomic: &'_ AtomicPtr<T>,
         deleter: &'static dyn Deleter,
@@ -145,26 +142,26 @@ pub trait HazPtrObject {
     fn retire(&mut self);
 }
 
-pub struct HazPtrObjectWrapper<'a, T: Drop> {
+pub struct HazPtrObjectWrapper<'a, T> {
     inner: *mut T,
     domain: &'a HazPtrDomain,
     deleter: &'static dyn Deleter,
 }
 
-impl<T: Drop> Deref for HazPtrObjectWrapper<'_, T> {
+impl<T> Deref for HazPtrObjectWrapper<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &(*self.inner) }
     }
 }
 
-impl<T: Drop> DerefMut for HazPtrObjectWrapper<'_, T> {
+impl<T> DerefMut for HazPtrObjectWrapper<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut (*self.inner) }
     }
 }
 
-impl<T: Drop> HazPtrObject for HazPtrObjectWrapper<'_, T> {
+impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
     fn domain<'a>(&'a self) -> &'a HazPtrDomain {
         self.domain
     }
@@ -176,7 +173,7 @@ impl<T: Drop> HazPtrObject for HazPtrObjectWrapper<'_, T> {
         let current = (&domain.ret.head).load(Ordering::SeqCst);
         loop {
             let ret = Ret {
-                ptr: self.inner as *mut dyn Drop,
+                ptr: self.inner as *mut dyn Uniform,
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 deleter: self.deleter,
             };
@@ -310,16 +307,29 @@ struct Retired {
     head: AtomicPtr<Ret>,
 }
 
+pub trait Uniform {}
+
+impl<T> Uniform for T {}
+
 struct Ret {
-    ptr: *mut dyn Drop,
+    ptr: *mut dyn Uniform,
     next: AtomicPtr<Ret>,
     deleter: &'static dyn Deleter,
 }
 
 pub trait Deleter {
-    fn delete(&self, ptr: *mut dyn Drop);
+    fn delete(&self, ptr: *mut dyn Uniform);
 }
 
+/// SAFETY:
+///   1. The user would have to pass an instance of one of the two zero sized types defined below:
+///     DropBox and DropPointer on the basis of how the actual raw pointer to the underlying type
+///     was created. This is necessary because using the drop_in_place() method on every pointer will
+///     not dealloate the instance of the box for all those pointers created using Box::into_raw().
+///   2. The user must create the instance using static as the trait object must have a static
+///      lifetime because we never know when the delete method on that deleter will be called.
+///      Using static does not come with any memory overhead as the underlying type would be a zero
+///      sized type.
 pub struct DropBox;
 
 impl DropBox {
@@ -329,7 +339,7 @@ impl DropBox {
 }
 
 impl Deleter for DropBox {
-    fn delete(&self, ptr: *mut dyn Drop) {
+    fn delete(&self, ptr: *mut dyn Uniform) {
         if let Some(_) = NonNull::new(ptr) {
             let drop = unsafe { Box::from_raw(ptr) };
             std::mem::drop(drop);
@@ -346,7 +356,7 @@ impl DropPointer {
 }
 
 impl Deleter for DropPointer {
-    fn delete(&self, ptr: *mut dyn Drop) {
+    fn delete(&self, ptr: *mut dyn Uniform) {
         if let Some(_) = NonNull::new(ptr) {
             unsafe {
                 std::ptr::drop_in_place(ptr);
