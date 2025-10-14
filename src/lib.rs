@@ -97,12 +97,16 @@ impl HazPtrHolder {
     ) -> Option<HazPtrObjectWrapper<'_, T>> {
         let current = atomic.load(Ordering::SeqCst);
         atomic.store(ptr, Ordering::SeqCst);
-        let wrapper = HazPtrObjectWrapper {
-            inner: current,
-            domain: &SHARED_DOMAIN,
-            deleter: deleter,
-        };
-        return Some(wrapper);
+        if current.is_null() {
+            return None;
+        } else {
+            let wrapper = HazPtrObjectWrapper {
+                inner: current,
+                domain: &SHARED_DOMAIN,
+                deleter: deleter,
+            };
+            return Some(wrapper);
+        }
     }
 
     ///SAFETY:
@@ -116,12 +120,16 @@ impl HazPtrHolder {
     ) -> Option<HazPtrObjectWrapper<'_, T>> {
         let current = atomic.load(Ordering::SeqCst);
         atomic.store(std::ptr::null_mut(), Ordering::SeqCst);
-        let wrapper = HazPtrObjectWrapper {
-            inner: current,
-            domain: &SHARED_DOMAIN,
-            deleter: deleter,
-        };
-        return Some(wrapper);
+        if current.is_null() {
+            return None;
+        } else {
+            let wrapper = HazPtrObjectWrapper {
+                inner: current,
+                domain: &SHARED_DOMAIN,
+                deleter: deleter,
+            };
+            return Some(wrapper);
+        }
     }
 }
 
