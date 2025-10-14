@@ -392,7 +392,19 @@ impl Retired {
             } else {
                 let next = unsafe { ((*now).next).load(Ordering::SeqCst) };
                 unsafe { (*now).next.store(remaining, Ordering::SeqCst) };
-                remaining = now;
+                if remaining.is_null() {
+                    remaining = now;
+                    unsafe {
+                        (*remaining)
+                            .next
+                            .store(std::ptr::null_mut(), Ordering::SeqCst);
+                    }
+                } else {
+                    unsafe {
+                        (*now).next.store(remaining, Ordering::SeqCst);
+                    }
+                    remaining = now;
+                }
                 now = next;
             }
         }
