@@ -50,8 +50,9 @@ pub(crate) struct RawDescriptor<'a, T> {
 impl<'a, T> Drop for RawDescriptor<'a, T> {
     fn drop(&mut self) {
         let mut holder = HazPtrHolder::default();
-        // not using hazptrs in this method will also work fine
-        // as it is the last thing being called
+        // not using hazptrs in the drop implementation is also fine
+        // because since it is the last thing being called on the RawDescriptor
+        // we can be sure that no other thread is going to drop it before we do
         let raw = unsafe { holder.load(&self.descriptor) };
         if raw.is_none() {
             return;
@@ -93,9 +94,6 @@ where
         let new = Box::into_raw(Box::new(Descriptor::new(ptr, next, after)));
         let mut holder = HazPtrHolder::default();
         loop {
-            ///SAFETY:
-            ///    Caller must ensure that the list does not get dropped before the call to
-            ///    this method completes
             let mut guard = unsafe { holder.load(&self.descriptor) };
             if guard.is_none() {
                 if self
