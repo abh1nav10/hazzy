@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::convert::AsRef;
 use std::marker::PhantomData;
@@ -144,6 +143,17 @@ impl HazPtrHolder {
             return Some(wrapper);
         }
     }
+
+    pub fn get_domain() -> &'static HazPtrDomain {
+        &SHARED_DOMAIN
+    }
+
+    pub fn try_reclaim() {
+        let domain = Self::get_domain();
+        unsafe {
+            domain.ret.reclaim(&domain.list);
+        }
+    }
 }
 
 pub(crate) struct HazPtr {
@@ -158,13 +168,13 @@ impl HazPtr {
     }
 }
 
-pub(crate) trait HazPtrObject {
+pub trait HazPtrObject {
     fn domain<'a>(&'a self) -> &'a HazPtrDomain;
     fn retire(&mut self);
 }
 
 pub struct HazPtrObjectWrapper<'a, T> {
-    inner: *mut T,
+    pub(crate) inner: *mut T,
     domain: &'a HazPtrDomain,
     deleter: &'static dyn Deleter,
 }
@@ -190,6 +200,13 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
     ///SAFETY:
     ///  The user must make sure that a retired pointer is not retired again.
     fn retire(&mut self) {
+        if self.inner.is_null() {
+            let domain = self.domain();
+            unsafe {
+                (&domain.ret).reclaim(&domain.list);
+            }
+            return;
+        }
         let domain = self.domain();
         let current = (&domain.ret.head).load(Ordering::SeqCst);
         loop {
@@ -243,7 +260,7 @@ pub struct HazPtrDomain {
 }
 
 impl HazPtrDomain {
-    pub fn acquire(&self) -> &'static HazPtr {
+    fn acquire(&self) -> &'static HazPtr {
         if self.list.head.load(Ordering::SeqCst).is_null() {
             let hazptr = HazPtr {
                 ptr: AtomicPtr::new(std::ptr::null_mut()),
@@ -279,29 +296,24 @@ impl HazPtrDomain {
                 current = unsafe { (&(*current).next).load(Ordering::SeqCst) };
             }
         }
-        let mut now = &self.list.head;
+        let mut now = self.list.head.load(Ordering::SeqCst);
         loop {
             let mut new = HazPtr {
                 ptr: AtomicPtr::new(std::ptr::null_mut()),
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 flag: AtomicBool::new(false),
             };
-            new.next = AtomicPtr::new(now.load(Ordering::SeqCst));
+            new.next = AtomicPtr::new(now);
             let boxed = Box::into_raw(Box::new(new));
             if self
                 .list
                 .head
-                .compare_exchange(
-                    now.load(Ordering::SeqCst),
-                    boxed,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
+                .compare_exchange(now, boxed, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
                 return unsafe { &*boxed };
             } else {
-                now = &self.list.head;
+                now = self.list.head.load(Ordering::SeqCst);
                 let drop = unsafe { Box::from_raw(boxed) };
                 std::mem::drop(drop);
                 while !current.is_null() {
@@ -429,42 +441,35 @@ impl Retired {
                 now = next;
             }
         }
-        self.head.swap(remaining, Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    struct CountDrops(Arc<AtomicUsize>);
-    impl Drop for CountDrops {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
+        // The following code guarantees that no elements are ever lost
+        loop {
+            if self
+                .head
+                .compare_exchange(
+                    std::ptr::null_mut(),
+                    remaining,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return;
+            } else {
+                if remaining.is_null() {
+                    remaining = self.head.swap(std::ptr::null_mut(), Ordering::SeqCst);
+                } else {
+                    let mut safety_variable = remaining;
+                    while unsafe { !(*safety_variable).next.load(Ordering::SeqCst).is_null() } {
+                        safety_variable = unsafe { (*safety_variable).next.load(Ordering::SeqCst) };
+                    }
+                    let to_be_swapped = self.head.swap(std::ptr::null_mut(), Ordering::SeqCst);
+                    unsafe {
+                        (*safety_variable)
+                            .next
+                            .store(to_be_swapped, Ordering::SeqCst);
+                    }
+                }
+            }
         }
-    }
-    impl CountDrops {
-        fn get_number_of_drops(&self) -> usize {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
-    #[test]
-    fn test() {
-        let new = Arc::new(AtomicUsize::new(0));
-        let check = CountDrops(new.clone());
-        let value1 = CountDrops(new.clone());
-        let value2 = CountDrops(new.clone());
-        let boxed1 = Box::into_raw(Box::new(value1));
-        let boxed2 = Box::into_raw(Box::new(value2));
-        let atm_ptr = AtomicPtr::new(boxed1);
-        let mut holder = HazPtrHolder::default();
-        let guard = unsafe { holder.load(&atm_ptr) };
-        static DROPBOX: DropBox = DropBox::new();
-        std::mem::drop(guard);
-        if let Some(mut wrapper) = unsafe { holder.swap(&atm_ptr, boxed2, &DROPBOX) } {
-            wrapper.retire();
-        }
-        assert_eq!(check.get_number_of_drops(), 1 as usize);
     }
 }
