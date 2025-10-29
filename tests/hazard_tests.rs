@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod hazard_test {
-    use hazzy::{DropBox, HazPtrHolder, HazPtrObject};
+    use hazzy::{BoxedPointer, Doer, Holder};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::sync::atomic::{AtomicPtr, AtomicUsize};
@@ -23,16 +23,22 @@ mod hazard_test {
         let value2 = CountDrops(new.clone());
         let boxed1 = Box::into_raw(Box::new(value1));
         let boxed2 = Box::into_raw(Box::new(value2));
-        let atm_ptr = AtomicPtr::new(boxed1);
-        let mut holder = HazPtrHolder::default();
-        let guard = unsafe { holder.load(&atm_ptr) };
-        static DROPBOX: DropBox = DropBox::new();
+        let ptr1 = AtomicPtr::new(boxed1);
+        let mut holder = Holder::default();
+        let guard = unsafe { holder.load_pointer(&ptr1) };
+        static DROPBOX: BoxedPointer = BoxedPointer::new();
         std::mem::drop(guard);
-        if let Some(mut wrapper) = unsafe { holder.swap(&atm_ptr, boxed2, &DROPBOX) } {
+        if let Some(mut wrapper) = unsafe { holder.swap(&ptr1, boxed2, &DROPBOX) } {
             wrapper.retire();
         }
         assert_eq!(check.get_number_of_drops(), 1 as usize);
-        let _ = unsafe { Box::from_raw(boxed2) };
-        std::mem::drop(check);
+        let ptr2 = AtomicPtr::new(boxed2);
+        let value3 = CountDrops(new.clone());
+        let boxed3 = Box::into_raw(Box::new(value3));
+        if let Some(mut wrapper) = unsafe { holder.swap(&ptr2, boxed3, &DROPBOX) } {
+            wrapper.retire();
+        }
+        assert_eq!(check.get_number_of_drops(), 2 as usize);
+        let _ = unsafe { Box::from_raw(boxed3) };
     }
 }

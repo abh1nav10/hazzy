@@ -7,20 +7,20 @@ use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicPtr};
 
-pub(crate) static SHARED_DOMAIN: HazPtrDomain = HazPtrDomain {
-    list: HazPtrs {
+pub(crate) static SHARED_DOMAIN: GlobalDomain = GlobalDomain {
+    list: HazardList {
         head: AtomicPtr::new(std::ptr::null_mut()),
     },
-    ret: Retired {
+    ret: RetiredList {
         head: AtomicPtr::new(std::ptr::null_mut()),
     },
 };
 
 #[derive(Default)]
-pub struct HazPtrHolder(Option<&'static HazPtr>);
+pub struct Holder(Option<&'static Hazard>);
 
 pub struct Guard<'a, T> {
-    hazptr: &'static HazPtr,
+    hazptr: &'static Hazard,
     pub(crate) data: *mut T,
     _marker: PhantomData<&'a T>,
 }
@@ -58,13 +58,13 @@ impl<T> Drop for Guard<'_, T> {
     }
 }
 
-impl HazPtrHolder {
+impl Holder {
     /// SAFETY:
     ///   1. The user must pass a valid pointer. Passing in invalid pointers such as a misaligned
     ///      one will cause undefined behaviour.
     ///   2. If a null pointer is passed that will be taken care of by the implementation as we
     ///      have made sure using NonNull that it does not get dereferenced.
-    pub unsafe fn load<'a, T>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<Guard<'a, T>> {
+    pub unsafe fn load_pointer<'a, T>(&'a mut self, ptr: &'_ AtomicPtr<T>) -> Option<Guard<'a, T>> {
         let hazptr = if let Some(t) = self.0 {
             t
         } else {
@@ -106,13 +106,13 @@ impl HazPtrHolder {
         atomic: &'_ AtomicPtr<T>,
         ptr: *mut T,
         deleter: &'static dyn Deleter,
-    ) -> Option<HazPtrObjectWrapper<'_, T>> {
+    ) -> Option<DoerWrapper<'_, T>> {
         let current = atomic.load(Ordering::SeqCst);
         atomic.store(ptr, Ordering::SeqCst);
         if current.is_null() {
             return None;
         } else {
-            let wrapper = HazPtrObjectWrapper {
+            let wrapper = DoerWrapper {
                 inner: current,
                 domain: &SHARED_DOMAIN,
                 deleter: deleter,
@@ -129,13 +129,13 @@ impl HazPtrHolder {
         &mut self,
         atomic: &'_ AtomicPtr<T>,
         deleter: &'static dyn Deleter,
-    ) -> Option<HazPtrObjectWrapper<'_, T>> {
+    ) -> Option<DoerWrapper<'_, T>> {
         let current = atomic.load(Ordering::SeqCst);
         atomic.store(std::ptr::null_mut(), Ordering::SeqCst);
         if current.is_null() {
             return None;
         } else {
-            let wrapper = HazPtrObjectWrapper {
+            let wrapper = DoerWrapper {
                 inner: current,
                 domain: &SHARED_DOMAIN,
                 deleter: deleter,
@@ -144,7 +144,7 @@ impl HazPtrHolder {
         }
     }
 
-    pub fn get_domain() -> &'static HazPtrDomain {
+    pub fn get_domain() -> &'static GlobalDomain {
         &SHARED_DOMAIN
     }
 
@@ -156,44 +156,44 @@ impl HazPtrHolder {
     }
 }
 
-pub(crate) struct HazPtr {
+pub(crate) struct Hazard {
     ptr: AtomicPtr<()>,
-    next: AtomicPtr<HazPtr>,
+    next: AtomicPtr<Hazard>,
     flag: AtomicBool,
 }
 
-impl HazPtr {
+impl Hazard {
     pub fn protect(&self, ptr: *mut ()) {
         self.ptr.store(ptr, Ordering::SeqCst);
     }
 }
 
-pub trait HazPtrObject {
-    fn domain<'a>(&'a self) -> &'a HazPtrDomain;
+pub trait Doer {
+    fn domain<'a>(&'a self) -> &'a GlobalDomain;
     fn retire(&mut self);
 }
 
-pub struct HazPtrObjectWrapper<'a, T> {
+pub struct DoerWrapper<'a, T> {
     pub(crate) inner: *mut T,
-    domain: &'a HazPtrDomain,
+    domain: &'a GlobalDomain,
     deleter: &'static dyn Deleter,
 }
 
-impl<T> Deref for HazPtrObjectWrapper<'_, T> {
+impl<T> Deref for DoerWrapper<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         unsafe { &(*self.inner) }
     }
 }
 
-impl<T> DerefMut for HazPtrObjectWrapper<'_, T> {
+impl<T> DerefMut for DoerWrapper<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut (*self.inner) }
     }
 }
 
-impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
-    fn domain<'a>(&'a self) -> &'a HazPtrDomain {
+impl<T> Doer for DoerWrapper<'_, T> {
+    fn domain<'a>(&'a self) -> &'a GlobalDomain {
         self.domain
     }
 
@@ -210,7 +210,7 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
         let domain = self.domain();
         let current = (&domain.ret.head).load(Ordering::SeqCst);
         loop {
-            let ret = Ret {
+            let ret = Retired {
                 ptr: self.inner as *mut dyn Uniform,
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 deleter: self.deleter,
@@ -254,15 +254,15 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
     }
 }
 
-pub struct HazPtrDomain {
-    list: HazPtrs,
-    ret: Retired,
+pub struct GlobalDomain {
+    list: HazardList,
+    ret: RetiredList,
 }
 
-impl HazPtrDomain {
-    fn acquire(&self) -> &'static HazPtr {
+impl GlobalDomain {
+    fn acquire(&self) -> &'static Hazard {
         if self.list.head.load(Ordering::SeqCst).is_null() {
-            let hazptr = HazPtr {
+            let hazptr = Hazard {
                 ptr: AtomicPtr::new(std::ptr::null_mut()),
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 flag: AtomicBool::new(false),
@@ -298,7 +298,7 @@ impl HazPtrDomain {
         }
         let mut now = self.list.head.load(Ordering::SeqCst);
         loop {
-            let mut new = HazPtr {
+            let mut new = Hazard {
                 ptr: AtomicPtr::new(std::ptr::null_mut()),
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 flag: AtomicBool::new(false),
@@ -332,21 +332,21 @@ impl HazPtrDomain {
     }
 }
 
-pub(crate) struct HazPtrs {
-    head: AtomicPtr<HazPtr>,
+pub(crate) struct HazardList {
+    head: AtomicPtr<Hazard>,
 }
 
-pub struct Retired {
-    head: AtomicPtr<Ret>,
+pub struct RetiredList {
+    head: AtomicPtr<Retired>,
 }
 
 pub trait Uniform {}
 
 impl<T> Uniform for T {}
 
-pub(crate) struct Ret {
+pub(crate) struct Retired {
     ptr: *mut dyn Uniform,
-    next: AtomicPtr<Ret>,
+    next: AtomicPtr<Retired>,
     deleter: &'static dyn Deleter,
 }
 
@@ -363,15 +363,15 @@ pub trait Deleter {
 ///      lifetime because we never know when the delete method on that deleter will be called.
 ///      Using static does not come with any memory overhead as the underlying type would be a zero
 ///      sized type.
-pub struct DropBox;
+pub struct BoxedPointer;
 
-impl DropBox {
+impl BoxedPointer {
     pub const fn new() -> Self {
-        DropBox
+        BoxedPointer
     }
 }
 
-impl Deleter for DropBox {
+impl Deleter for BoxedPointer {
     fn delete(&self, ptr: *mut dyn Uniform) {
         if let Some(_) = NonNull::new(ptr) {
             let drop = unsafe { Box::from_raw(ptr) };
@@ -398,12 +398,12 @@ impl Deleter for DropPointer {
     }
 }
 
-impl Retired {
+impl RetiredList {
     /// SAFETY:
     ///    The user must make sure that the reclaim method is not called on the list of retired
     ///    pointers contaning two similar pointers as this will lead to the same pointers being
     ///    dereferenced leading to undefined behaviour.
-    unsafe fn reclaim<'a>(&self, domain: &'a HazPtrs) {
+    unsafe fn reclaim<'a>(&self, domain: &'a HazardList) {
         let mut set = HashSet::new();
         let mut current = (&(domain.head)).load(Ordering::SeqCst);
         while !current.is_null() {
@@ -441,7 +441,8 @@ impl Retired {
                 now = next;
             }
         }
-        // The following code guarantees that no elements are ever lost
+        // we also need to make sure that we take care of all the pointers that have been retired
+        // in the meantime..therefore I came up with this solution
         loop {
             if self
                 .head

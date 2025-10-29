@@ -1,3 +1,3 @@
 mod hazard;
 
-pub use crate::hazard::{DropBox, DropPointer, HazPtrHolder, HazPtrObject};
+pub use crate::hazard::{BoxedPointer, Doer, DropPointer, Holder};
