@@ -27,18 +27,27 @@ mod hazard_test {
         let mut holder = Holder::default();
         let guard = unsafe { holder.load_pointer(&ptr1) };
         static DROPBOX: BoxedPointer = BoxedPointer::new();
-        std::mem::drop(guard);
-        if let Some(mut wrapper) = unsafe { holder.swap(&ptr1, boxed2, &DROPBOX) } {
+        let mut holder2 = Holder::default();
+        if let Some(mut wrapper) = unsafe { holder2.swap(&ptr1, boxed2, &DROPBOX) } {
             wrapper.retire();
         }
+
+        assert_eq!(check.get_number_of_drops(), 0 as usize);
+
+        std::mem::drop(guard);
+        Holder::try_reclaim();
+
         assert_eq!(check.get_number_of_drops(), 1 as usize);
+
         let ptr2 = AtomicPtr::new(boxed2);
         let value3 = CountDrops(new.clone());
         let boxed3 = Box::into_raw(Box::new(value3));
         if let Some(mut wrapper) = unsafe { holder.swap(&ptr2, boxed3, &DROPBOX) } {
             wrapper.retire();
         }
+
         assert_eq!(check.get_number_of_drops(), 2 as usize);
+
         let _ = unsafe { Box::from_raw(boxed3) };
     }
 }
