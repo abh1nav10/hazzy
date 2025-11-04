@@ -52,8 +52,8 @@ impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
         self.hazptr
             .ptr
-            .store(std::ptr::null_mut(), Ordering::SeqCst);
-        self.hazptr.flag.store(true, Ordering::SeqCst);
+            .store(std::ptr::null_mut(), Ordering::Release);
+        self.hazptr.flag.store(true, Ordering::Release);
     }
 }
 
@@ -71,10 +71,10 @@ impl Holder {
             self.0 = Some(ptr);
             ptr
         };
-        let mut ptr1 = ptr.load(Ordering::SeqCst);
+        let mut ptr1 = ptr.load(Ordering::Acquire);
         let ret = loop {
             hazptr.protect(ptr1 as *mut ());
-            let ptr2 = ptr.load(Ordering::SeqCst);
+            let ptr2 = ptr.load(Ordering::Acquire);
             if ptr1 == ptr2 {
                 if let Some(_) = NonNull::new(ptr1) {
                     let data = ptr1;
@@ -106,8 +106,7 @@ impl Holder {
         ptr: *mut T,
         deleter: &'static dyn Deleter,
     ) -> Option<DoerWrapper<'_, T>> {
-        let current = atomic.load(Ordering::SeqCst);
-        atomic.store(ptr, Ordering::SeqCst);
+        let current = atomic.swap(ptr, Ordering::AcqRel);
         if current.is_null() {
             return None;
         } else {
@@ -129,8 +128,7 @@ impl Holder {
         atomic: &'_ AtomicPtr<T>,
         deleter: &'static dyn Deleter,
     ) -> Option<DoerWrapper<'_, T>> {
-        let current = atomic.load(Ordering::SeqCst);
-        atomic.store(std::ptr::null_mut(), Ordering::SeqCst);
+        let current = atomic.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if current.is_null() {
             return None;
         } else {
@@ -207,23 +205,23 @@ impl<T> Doer for DoerWrapper<'_, T> {
             return;
         }
         let domain = self.domain();
-        let mut current = (&domain.ret.head).load(Ordering::SeqCst);
+        let mut current = (&domain.ret.head).load(Ordering::Acquire);
         loop {
             let ret = Retired {
                 ptr: self.inner as *mut dyn Uniform,
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 deleter: self.deleter,
             };
-            ret.next.store(current, Ordering::SeqCst);
+            ret.next.store(current, Ordering::Release);
             let boxed = Box::into_raw(Box::new(ret));
             if domain
                 .ret
                 .head
-                .compare_exchange(current, boxed, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(current, boxed, Ordering::AcqRel, Ordering::Relaxed)
                 .is_err()
             {
                 let drop = unsafe { Box::from_raw(boxed) };
-                current = (&domain.ret.head).load(Ordering::SeqCst);
+                current = (&domain.ret.head).load(Ordering::Acquire);
                 std::mem::drop(drop);
             } else {
                 unsafe { (&domain.ret).reclaim(&domain.list) };
@@ -240,62 +238,38 @@ pub struct GlobalDomain {
 
 impl GlobalDomain {
     fn acquire(&self) -> &'static Hazard {
-        if self.list.head.load(Ordering::SeqCst).is_null() {
-            let hazptr = Hazard {
-                ptr: AtomicPtr::new(std::ptr::null_mut()),
-                next: AtomicPtr::new(std::ptr::null_mut()),
-                flag: AtomicBool::new(false),
-            };
-            let raw = Box::into_raw(Box::new(hazptr));
-            if self
-                .list
-                .head
-                .compare_exchange(
-                    std::ptr::null_mut(),
-                    raw,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-                .is_ok()
-            {
-                return unsafe { &*raw };
-            } else {
-                let drop = unsafe { Box::from_raw(raw) };
-                std::mem::drop(drop);
-            }
-        }
-        let mut current = (&self.list.head).load(Ordering::SeqCst);
+        let mut current = (&self.list.head).load(Ordering::Acquire);
         while !current.is_null() {
             if unsafe { &(*current).flag }
-                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
                 return unsafe { &(*current) };
             } else {
-                current = unsafe { (&(*current).next).load(Ordering::SeqCst) };
+                current = unsafe { (&(*current).next).load(Ordering::Acquire) };
             }
         }
 
-        let mut now = self.list.head.load(Ordering::SeqCst);
+        let mut now = self.list.head.load(Ordering::Acquire);
         loop {
             let new = Hazard {
                 ptr: AtomicPtr::new(std::ptr::null_mut()),
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 flag: AtomicBool::new(false),
             };
-            new.next.store(now, Ordering::SeqCst);
+            new.next.store(now, Ordering::Release);
             let boxed = Box::into_raw(Box::new(new));
             if self
                 .list
                 .head
-                .compare_exchange(now, boxed, Ordering::SeqCst, Ordering::SeqCst)
+                .compare_exchange(now, boxed, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
                 return unsafe { &*boxed };
             } else {
                 let drop = unsafe { Box::from_raw(boxed) };
                 std::mem::drop(drop);
-                now = self.list.head.load(Ordering::SeqCst);
+                now = self.list.head.load(Ordering::Acquire);
             }
         }
     }
@@ -374,12 +348,12 @@ impl RetiredList {
     ///    dereferenced leading to undefined behaviour.
     unsafe fn reclaim<'a>(&self, domain: &'a HazardList) {
         let mut set = HashSet::new();
-        let mut swapped = (self.head).swap(std::ptr::null_mut(), Ordering::SeqCst);
-        let mut current = (&(domain.head)).load(Ordering::SeqCst);
+        let mut swapped = (self.head).swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let mut current = (&(domain.head)).load(Ordering::Acquire);
         while !current.is_null() {
-            let a = unsafe { (*current).ptr.load(Ordering::SeqCst) };
+            let a = unsafe { (*current).ptr.load(Ordering::Acquire) };
             set.insert(a);
-            current = unsafe { (&(*current).next).load(Ordering::SeqCst) };
+            current = unsafe { (&(*current).next).load(Ordering::Acquire) };
         }
         let mut remaining: *mut Retired = std::ptr::null_mut();
         while !swapped.is_null() {
@@ -388,21 +362,21 @@ impl RetiredList {
                 let deleter = unsafe { (*swapped).deleter };
                 deleter.delete(check);
                 let to_be_dropped = swapped;
-                swapped = unsafe { ((*swapped).next).load(Ordering::SeqCst) };
+                swapped = unsafe { ((*swapped).next).load(Ordering::Acquire) };
                 let drop = unsafe { Box::from_raw(to_be_dropped) };
                 std::mem::drop(drop);
             } else {
-                let next = unsafe { ((*swapped).next).load(Ordering::SeqCst) };
+                let next = unsafe { ((*swapped).next).load(Ordering::Acquire) };
                 if remaining.is_null() {
                     remaining = swapped;
                     unsafe {
                         (*remaining)
                             .next
-                            .store(std::ptr::null_mut(), Ordering::SeqCst);
+                            .store(std::ptr::null_mut(), Ordering::Release);
                     }
                 } else {
                     unsafe {
-                        (*swapped).next.store(remaining, Ordering::SeqCst);
+                        (*swapped).next.store(remaining, Ordering::Release);
                     }
                     remaining = swapped;
                 }
@@ -417,7 +391,7 @@ impl RetiredList {
                 .compare_exchange(
                     std::ptr::null_mut(),
                     remaining,
-                    Ordering::SeqCst,
+                    Ordering::AcqRel,
                     Ordering::Relaxed,
                 )
                 .is_ok()
@@ -425,17 +399,18 @@ impl RetiredList {
                 return;
             } else {
                 if remaining.is_null() {
-                    remaining = self.head.swap(std::ptr::null_mut(), Ordering::SeqCst);
+                    remaining = self.head.swap(std::ptr::null_mut(), Ordering::AcqRel);
                 } else {
                     let mut safety_variable = remaining;
-                    while unsafe { !(*safety_variable).next.load(Ordering::SeqCst).is_null() } {
-                        safety_variable = unsafe { (*safety_variable).next.load(Ordering::SeqCst) };
+                    while unsafe { !(*safety_variable).next.load(Ordering::Acquire).is_null() } {
+                        safety_variable =
+                            unsafe { (*safety_variable).next.load(Ordering::Acquire) };
                     }
-                    let to_be_swapped = self.head.swap(std::ptr::null_mut(), Ordering::SeqCst);
+                    let to_be_swapped = self.head.swap(std::ptr::null_mut(), Ordering::AcqRel);
                     unsafe {
                         (*safety_variable)
                             .next
-                            .store(to_be_swapped, Ordering::SeqCst);
+                            .store(to_be_swapped, Ordering::Release);
                     }
                 }
             }
